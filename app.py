@@ -21,13 +21,15 @@ from demucs.apply import apply_model
 import warnings
 
 warnings.filterwarnings("ignore")
-os.environ["PATH"] += os.pathsep + r"C:\Users\sampa\OneDrive\Desktop\ffmpeg-2025-04-23-git-25b0a8e295-full_build\bin"
-AudioSegment.converter = r"C:\Users\sampa\OneDrive\Desktop\ffmpeg-2025-04-23-git-25b0a8e295-full_build\bin\ffmpeg.exe"
-AudioSegment.ffprobe = r"C:\Users\sampa\OneDrive\Desktop\ffmpeg-2025-04-23-git-25b0a8e295-full_build\bin\ffprobe.exe"
+
+# ✅ UPDATE THIS to your actual ffmpeg/bin folder path
+ffmpeg_path = r"C:\Users\sampa\Downloads\ffmpeg-7.1.1-full_build\ffmpeg-7.1.1-full_build\bin"
+os.environ["PATH"] += os.pathsep + ffmpeg_path
+AudioSegment.converter = os.path.join(ffmpeg_path, "ffmpeg.exe")
+AudioSegment.ffprobe = os.path.join(ffmpeg_path, "ffprobe.exe")
 
 st.set_page_config(page_title="AuraLift", layout="wide")
 
-# Load MusicGen model once
 @st.cache_resource
 def load_musicgen_model():
     processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
@@ -38,7 +40,6 @@ def load_musicgen_model():
 
 processor, model, device = load_musicgen_model()
 
-# ---------- Helper Functions ----------
 def convert_to_wav(audio_file):
     try:
         sound = AudioSegment.from_file(audio_file)
@@ -50,19 +51,40 @@ def convert_to_wav(audio_file):
         return None
 
 def separate_audio(input_wav):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = get_model(name='htdemucs')
-    model.to(device)
-    with st.spinner("Separating..."):
-        stems = apply_model(model, input_wav, device=device)
-    output_dir = os.path.splitext(input_wav)[0] + "_output"
-    os.makedirs(output_dir, exist_ok=True)
-    vocals_path = os.path.join(output_dir, "vocals.wav")
-    accompaniment_path = os.path.join(output_dir, "accompaniment.wav")
-    stems[0].save(vocals_path)
-    accompaniment = stems[1] + stems[2] + stems[3]
-    accompaniment.save(accompaniment_path)
-    return vocals_path, accompaniment_path
+    try:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = get_model(name='htdemucs')
+        model.to(device)
+
+        # Load and resample audio to 44.1kHz
+        wav, sr = torchaudio.load(input_wav)
+        if sr != 44100:
+            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=44100)
+            wav = resampler(wav)
+            sr = 44100
+
+        wav = wav.unsqueeze(0).to(device)  # [1, channels, samples]
+
+        with st.spinner("Separating audio..."):
+            stems = apply_model(model, wav, device=device)
+
+        output_dir = os.path.splitext(input_wav)[0] + "_output"
+        os.makedirs(output_dir, exist_ok=True)
+
+        vocals_path = os.path.join(output_dir, "vocals.wav")
+        accompaniment_path = os.path.join(output_dir, "accompaniment.wav")
+
+        # 💥 FIXED: remove batch dim for torchaudio.save()
+        torchaudio.save(vocals_path, stems[0].squeeze(0).cpu(), sample_rate=sr)
+        acc = stems[1] + stems[2] + stems[3]
+        torchaudio.save(accompaniment_path, acc.squeeze(0).cpu(), sample_rate=sr)
+
+        return vocals_path, accompaniment_path
+
+    except Exception as e:
+        st.error(f"Error during separation: {str(e)}")
+        return None, None
+
 
 def plot_waveform(filepath, title):
     y, sr = librosa.load(filepath, sr=None)
@@ -144,40 +166,58 @@ def apply_all_effects(y, sr, opts):
     if opts['chorus'] > 0: y = apply_chorus(y, sr, mix=opts['chorus'])
     return y / np.max(np.abs(y))
 
-# ---------- UI ----------
+# UI
 st.title("🎧 AuraLift")
 tab1, tab2, tab3 = st.tabs(["🔀 Vocal Split", "🎛️ Vocal FX", "🎶 AI Music"])
 
-# Vocal & Non-Vocal
 with tab1:
-    st.subheader("Upload or Paste a YouTube link")
-    upload = st.file_uploader("Upload MP3/WAV/M4A", type=["mp3", "wav", "m4a"])
+    st.subheader("Upload or Paste YouTube Link")
+
+    if 'separation_done' not in st.session_state:
+        st.session_state.separation_done = False
+
+    uploaded_file = st.file_uploader("Upload MP3/WAV/M4A", type=["mp3", "wav", "m4a"])
     yt_link = st.text_input("Or paste YouTube link")
 
-    if upload:
-        wav = convert_to_wav(upload)
-        vocals, nonvocals = separate_audio(wav)
+    if uploaded_file and not st.session_state.separation_done:
+        wav = convert_to_wav(uploaded_file)
+        if wav:
+            vocals, nonvocals = separate_audio(wav)
+            if vocals and nonvocals:
+                st.session_state.vocals = vocals
+                st.session_state.nonvocals = nonvocals
+                st.session_state.separation_done = True
+
     elif yt_link and st.button("Process YouTube"):
         yt = YouTube(yt_link)
         stream = yt.streams.filter(only_audio=True).last()
         stream.download(filename="yt_audio.mp4")
         wav = convert_to_wav("yt_audio.mp4")
         vocals, nonvocals = separate_audio(wav)
+        if vocals and nonvocals:
+            st.session_state.vocals = vocals
+            st.session_state.nonvocals = nonvocals
+            st.session_state.separation_done = True
 
-    if 'vocals' in locals() and vocals and nonvocals:
-        st.success("Done! Preview below 👇")
+    # ✅ Once done, show results
+    if st.session_state.separation_done:
+        st.success("Separation complete! 🎉")
+
         st.subheader("🎤 Vocals")
-        process_audio_player(vocals, "Vocals")
-        plot_waveform(vocals, "Vocals")
+        process_audio_player(st.session_state.vocals, "Vocals")
+        plot_waveform(st.session_state.vocals, "Vocals")
 
         st.subheader("🎸 Non-Vocals")
-        process_audio_player(nonvocals, "Non-Vocals")
-        plot_waveform(nonvocals, "Non-Vocals")
+        process_audio_player(st.session_state.nonvocals, "Non-Vocals")
+        plot_waveform(st.session_state.nonvocals, "Non-Vocals")
 
-# Vocal FX
+        if st.button("🔁 Process another file"):
+            st.session_state.separation_done = False
+            st.experimental_rerun()
+
+
 with tab2:
     st.sidebar.header("FX Controls")
-    st.subheader("Upload file on the side bar. (To the left)")
     fx_file = st.sidebar.file_uploader("Upload vocals", type=["wav", "mp3"])
     preset = st.sidebar.selectbox("Preset", ["Custom", "Radio", "Concert Hall", "Lo-fi"])
     autotune = st.sidebar.checkbox("Autotune")
@@ -207,7 +247,6 @@ with tab2:
             st.audio(buffer, format="audio/wav")
             st.download_button("⬇️ Download", buffer, "processed.wav", "audio/wav")
 
-# AI Music Generator
 with tab3:
     prompt = st.text_area("🎼 Describe your music", "Lo-fi beat with rain sounds")
     duration = st.slider("🎵 Duration (s)", 5, 30, 10)
